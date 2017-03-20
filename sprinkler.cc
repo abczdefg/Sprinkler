@@ -267,7 +267,7 @@ void Sprinkler_Agent::Broadcast_Handler(Packet *p) {
 				shdr_NAK->srcColor = color;
 				shdr_NAK->srcID = nodeID;
 				shdr_NAK->desID = parentID;
-				shdr_NAK->pktID = lastSendPktID + 1; //请求last+1数据包
+				shdr_NAK->pktID = lastRecvPktID + 1; //请求last+1数据包
 				shdr_NAK->sendTime = shdr->sendTime; //NAK包含接收数据包的发送时间
 				// printf("At %lf node_%d向node_%d发出了NAK\n",NOWTIME, nodeID, parentID);
 				send( pkt_NAK, 0 );
@@ -287,22 +287,49 @@ void Sprinkler_Agent::Unicast_Handler(Packet *p) {
 	if (shdr->srcID == parentID && !CDS) {
 		nodeStatus = RX;
 		if(pktRecvNum < pktNum && shdr->pktID >= 0) {
-			lastRecvPktID = shdr->pktID;
-			++ pktRecvNum;
-			if (lastRecvPktID >= 0 && lastRecvPktID <= pktNum - 1) {
-				if (lastRecvPktID ==  pktNum - 1) {
-					nodeStatus = MAINTAIN;
-					if(pktNum == pktRecvNum) { 
-						++ NCDS_pktRecvNum;
-						printf("At %lf node_%d 接收完毕, 来自node_%d, 目前NCDS接收%d个\n", NOWTIME, nodeID, parentID, NCDS_pktRecvNum);
-						if (NCDS_pktRecvNum == maxRow * maxCol - CDS_Num) {
-							printf("At %lf NCDS接收完毕, 总消息数%d\n", NOWTIME, totalTr);
+			if (lastRecvPktID + 1 == shdr->pktID) {
+				// 连续的数据包
+				lastRecvPktID = shdr->pktID;
+				++ pktRecvNum;
+				if (lastRecvPktID >= 0 && lastRecvPktID <= pktNum - 1) {
+					if (lastRecvPktID ==  pktNum - 1) {
+						nodeStatus = MAINTAIN;
+						if(pktNum == pktRecvNum) { 
+							++ NCDS_pktRecvNum;
+							printf("At %lf node_%d 接收完毕, 来自node_%d, 目前NCDS接收%d个\n", NOWTIME, nodeID, parentID, NCDS_pktRecvNum);
+							if (NCDS_pktRecvNum == maxRow * maxCol - CDS_Num) {
+								printf("At %lf NCDS接收完毕, 总消息数%d\n", NOWTIME, totalTr);
+							}
+						} else {
+							printf("node_%d 未接收完整, 接收总数%d, 来自node_%d\n", nodeID, pktRecvNum, parentID);
 						}
-					} else {
-						printf("node_%d 未接收完整, 接收总数%d, 来自node_%d\n", nodeID, pktRecvNum, parentID);
-					}
-				} 
+					} 
+				}
+			} else if (lastRecvPktID <= shdr->pktID) {
+				lastRecvPktID = shdr->pktID;
+				pktRecvNum = lastRecvPktID + 1;
+			} else{
+				//非连续，发出NAK
+				nodeStatus = TX;
+				Packet* pkt_NAK = allocpkt(); //数据包的生成
+				hdr_ip *iph_NAK = hdr_ip::access(pkt_NAK); //数据包的访问
+				hdr_sprinkler *shdr_NAK = hdr_sprinkler::access(pkt_NAK);
+				iph_NAK->saddr() = nodeID; //源IP地址
+				iph_NAK->daddr() = parentID; //目的IP地址
+
+				shdr_NAK->msgType = NAK;
+				shdr_NAK->srcColor = color;
+				shdr_NAK->srcID = nodeID;
+				shdr_NAK->desID = parentID;
+				shdr_NAK->pktID = lastRecvPktID + 1; //请求last+1数据包
+				shdr_NAK->sendTime = shdr->sendTime; //NAK包含接收数据包的发送时间
+				// printf("At %lf node_%d向node_%d发出了NAK\n",NOWTIME, nodeID, parentID);
+				send( pkt_NAK, 0 );
+				totalTr++;	
+
+				nodeStatus = RX; //发送请求后进入RX模式
 			}
+
 		} else if (shdr->pktID < 0) {
 			//重发请求
 			nodeStatus = MAINTAIN;
@@ -347,22 +374,27 @@ void Sprinkler_Agent::REQ_Handler(Packet *p) {
 void Sprinkler_Agent::NAK_Handler(Packet *p) {
 	hdr_sprinkler *shdr_recv = hdr_sprinkler::access(p);
 	// printf("node_%d收到了来自node_%dNAK\n", nodeID, shdr_recv->srcID);
-
+	// 
 	Packet* pkt = allocpkt(); //数据包的生成
 	hdr_ip *iph = hdr_ip::access(pkt); //数据包的访问
 	hdr_sprinkler *shdr_send = hdr_sprinkler::access(pkt);
 	iph->saddr() = nodeID; //源IP地址
 	iph->daddr() = shdr_recv->srcID; //目的IP地址
-	shdr_send->msgType = BROADCAST;
 	shdr_send->srcColor = color;
 	shdr_send->srcID = nodeID;
 	shdr_send->desID = shdr_recv->srcID;
 	shdr_send->pktID = shdr_recv->pktID;
 	shdr_send->sendTime = NOWTIME;
-	printf("At %lf node_%d发送pkt_%d\n", NOWTIME, nodeID, shdr_recv->pktID);
-	send(pkt, 0);	
 
-	t->resched(sPeriod - NOWTIME + shdr_recv->sendTime); //重置发送定时器
+	if (nodePhase == STREAMING) {
+		shdr_send->msgType = BROADCAST;
+		t->resched(sPeriod - NOWTIME + shdr_recv->sendTime); //重置发送定时器
+	} else if (nodePhase == RECOVERY) {
+		shdr_send->msgType = UNICAST;
+		t3->resched(INTERVAL); //重置发送定时器
+	}
+	send(pkt, 0);	
+	// printf("At %lf node_%d回复NAK 发送pkt_%d\n", NOWTIME, nodeID, shdr_recv->pktID);
 }
 
 void Sprinkler_Agent::neighborsFind(int neighbors[], int maxRow, int maxCol, int row, int col) {
